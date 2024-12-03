@@ -2236,7 +2236,6 @@ int netif_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
 
     if (mbuf->port != dev->id)
         mbuf->port = dev->id;
-
     /* assert for possible double free */
     mbuf_refcnt = rte_mbuf_refcnt_read(mbuf);
     assert((mbuf_refcnt >= 1) && (mbuf_refcnt <= 64));
@@ -2269,7 +2268,7 @@ static inline eth_type_t eth_type_parse(const struct ether_hdr *eth_hdr,
 int netif_rcv(struct netif_port *dev, __be16 eth_type, struct rte_mbuf *mbuf)
 {
     struct pkt_type *pt;
-    assert(dev && mbuf && mbuf->port <= NETIF_MAX_PORTS);
+    // assert(dev && mbuf && mbuf->port <= NETIF_MAX_PORTS);
 
     pt = pkt_type_get(eth_type, dev);
     if (!pt)
@@ -2277,7 +2276,8 @@ int netif_rcv(struct netif_port *dev, __be16 eth_type, struct rte_mbuf *mbuf)
 
     mbuf->l2_len = 0; /* make sense ? */
 
-    return pt->func(mbuf, dev);
+    int r = pt->func(mbuf, dev);
+    return r;
 }
 
 static int netif_deliver_mbuf(struct netif_port *dev, lcoreid_t cid,

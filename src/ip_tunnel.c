@@ -343,7 +343,7 @@ static int tunnel_update_pmtu(struct netif_port *dev, struct rte_mbuf *mbuf,
     return EDPVS_OK;
 }
 
-static int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
+int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
                        uint8_t proto, uint8_t tos, uint8_t ttl, __be16 df)
 {
     struct iphdr *oiph; /* outter IP header */
@@ -363,7 +363,6 @@ static int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
     oiph->saddr     = src;
     oiph->ttl       = ttl;
     oiph->id        = ip4_select_id((struct ipv4_hdr *)oiph);
-
     return ipv4_local_out(mbuf);
 }
 
@@ -686,7 +685,6 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_tab *tab,
 
     hlist_for_each_entry(tnl, head, hlist) {
         if (local != tnl->params.iph.saddr ||
-            remote != tnl->params.iph.daddr ||
             !(tnl->dev->flag & NETIF_PORT_FLAG_RUNNING))
             continue;
 
@@ -700,7 +698,7 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_tab *tab,
     }
 
     hlist_for_each_entry(tnl, head, hlist) {
-        if (remote != tnl->params.iph.daddr ||
+        if (
             tnl->params.iph.saddr != 0 ||
             !(tnl->dev->flag & NETIF_PORT_FLAG_RUNNING))
             continue;
@@ -781,7 +779,7 @@ int ip_tunnel_rcv(struct ip_tunnel *tnl, struct ip_tunnel_pktinfo *tpi,
     }
 
     mbuf->port = tnl->dev->id;
-
+    // return netif_rcv(NULL, htons(ETH_P_IP), mbuf);
     return netif_rcv(tnl->dev, htons(ETH_P_IP), mbuf);
 
 drop:
@@ -789,8 +787,8 @@ drop:
     return EDPVS_DROP;
 }
 
-/* linux: ip_tunnel_xmit */
-int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
+
+int ip_tunnel_xmit_2(struct rte_mbuf *mbuf, struct netif_port *dev,
                    const struct iphdr *tiph, uint8_t proto)
 {
     struct ip_tunnel    *tnl = netif_priv(dev);
@@ -801,7 +799,7 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
     uint8_t             tos, ttl;
     bool                connected;
     __be16              df;
-    __be32              dip;
+    __be32              sip, dip;
 
     assert(mbuf && dev && tiph);
 
@@ -810,7 +808,16 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
 
     connected = tiph->daddr != 0;
 
-    dip = tiph->daddr;
+    if (mbuf->vvtep_addr != 0 && mbuf->cvtep_addr != 0) {
+        // match session
+        sip = mbuf->vvtep_addr;
+        dip = mbuf->cvtep_addr;
+    } else {
+        // match route
+        sip = tiph->saddr;
+        dip = tiph->daddr;
+    }
+    
     if (!dip) {
         /* TODO: NBMA tunnel */
         RTE_LOG(DEBUG, TUNNEL, "%s: NBMA dev not support\n", __func__);
@@ -832,7 +839,107 @@ int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
         /* not connected or no route cache */
         fl4.fl4_proto           = proto;
         fl4.fl4_daddr.s_addr    = dip;
-        fl4.fl4_saddr.s_addr    = tiph->saddr;
+        fl4.fl4_saddr.s_addr    = sip;
+        fl4.fl4_tos             = tos;
+        fl4.fl4_oif             = tnl->link;
+
+        rt = route4_output(&fl4);
+        if (!rt) {
+            err = EDPVS_NOROUTE;
+            goto errout;
+        }
+
+        tunnel_clear_rt_cache(tnl);
+        tnl->rt_cache = rt;
+        /* refer route in tunnel do not put it. */
+    }
+
+    if (rt->port == dev)
+        goto errout;
+
+    /* refer route in mbuf and this reference will be put later. */
+    route4_get(rt);
+    mbuf->userdata = (void *)rt;
+
+    err = tunnel_update_pmtu(dev, mbuf, rt, tiph->frag_off, iiph);
+    if (err != EDPVS_OK)
+        goto errout;
+
+    ttl = tiph->ttl;
+    if (!ttl) {
+        if (iiph)
+            ttl = iiph->ttl;
+        else
+            ttl = INET_DEF_TTL;
+    }
+
+    df = tiph->frag_off;
+    if (iiph)
+        df |= (iiph->frag_off & htons(IP_DF));
+
+    if (!rt->src.s_addr)
+        RTE_LOG(WARNING, TUNNEL, "%s: xmit with no source IP\n", __func__);
+
+    return tunnel_xmit(mbuf, rt->src.s_addr, dip, proto, tos, ttl, df);
+
+errout:
+    rte_pktmbuf_free(mbuf);
+    return err;
+}
+
+/* linux: ip_tunnel_xmit */
+int ip_tunnel_xmit(struct rte_mbuf *mbuf, struct netif_port *dev,
+                   const struct iphdr *tiph, uint8_t proto)
+{
+    struct ip_tunnel    *tnl = netif_priv(dev);
+    const struct iphdr  *iiph = NULL; /* inner ip header*/
+    struct route_entry  *rt;
+    struct flow4        fl4 = {};
+    int                 err = EDPVS_DROP;
+    uint8_t             tos, ttl;
+    bool                connected;
+    __be16              df;
+    __be32              sip, dip;
+
+    assert(mbuf && dev && tiph);
+
+    if (mbuf->packet_type == ETHER_TYPE_IPv4)
+        iiph = rte_pktmbuf_mtod_offset(mbuf, struct iphdr *, tnl->hlen);
+
+    connected = tiph->daddr != 0;
+
+    if (mbuf->vvtep_addr != 0 && mbuf->cvtep_addr != 0) {
+        // match session
+        sip = mbuf->vvtep_addr;
+        dip = mbuf->cvtep_addr;
+    } else {
+        // match route
+        sip = tiph->saddr;
+        dip = tiph->daddr;
+    }
+    
+    if (!dip) {
+        /* TODO: NBMA tunnel */
+        RTE_LOG(DEBUG, TUNNEL, "%s: NBMA dev not support\n", __func__);
+        err = EDPVS_NOTSUPP;
+        goto errout;
+    }
+
+    tos = tiph->tos;
+    if (tos & 0x1) {
+        tos &= ~0x1;
+        if (iiph)
+            tos = iiph->tos;
+        connected = false;
+    }
+
+    /* try cache first then route lookup */
+    rt = connected ? tnl->rt_cache : NULL;
+    if (!rt) {
+        /* not connected or no route cache */
+        fl4.fl4_proto           = proto;
+        fl4.fl4_daddr.s_addr    = dip;
+        fl4.fl4_saddr.s_addr    = sip;
         fl4.fl4_tos             = tos;
         fl4.fl4_oif             = tnl->link;
 

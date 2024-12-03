@@ -15,6 +15,8 @@
  * GNU General Public License for more details.
  *
  */
+
+#include <stdint.h> 
 #include <stdio.h>
 #include <assert.h>
 #include <netinet/in.h>
@@ -27,6 +29,10 @@
 #include "icmp.h"
 #include "parser/parser.h"
 #include "iftraf.h"
+#include "rte_ether.h"
+
+#include "ip_tunnel.h"
+#include "rte_gre.h"
 
 #define IPV4
 #define RTE_LOGTYPE_IPV4    RTE_LOGTYPE_USER1
@@ -258,11 +264,9 @@ int ipv4_output(struct rte_mbuf *mbuf)
 {
     struct route_entry *rt = mbuf->userdata;
     assert(rt);
-
     IP4_UPD_PO_STATS(out, mbuf->pkt_len);
     mbuf->port = rt->port->id;
     iftraf_pkt_out(AF_INET, mbuf, rt->port);
-
     return INET_HOOK(AF_INET, INET_HOOK_POST_ROUTING, mbuf,
             NULL, rt->port, ipv4_output_fin);
 }
@@ -395,6 +399,63 @@ static int ipv4_rcv(struct rte_mbuf *mbuf, struct netif_port *port)
 
     iph = ip4_hdr(mbuf);
 
+    if (iph->next_proto_id == IPPROTO_GRE) {
+        mbuf->vvtep_addr = iph->dst_addr;
+        mbuf->cvtep_addr = iph->src_addr;
+        mbuf->tnl_proto = IPPROTO_GRE;
+
+        if (ip_tunnel_pull_header(mbuf, sizeof(struct ipv4_hdr), IPPROTO_IP) != 0) {
+            return EDPVS_DROP;
+        }
+        
+        if (ip_tunnel_pull_header(mbuf, sizeof(struct gre_hdr), IPPROTO_GRE) != 0) {
+            return EDPVS_DROP;
+        }
+        struct netif_port *newport = netif_port_get_by_name("gre1");
+        return ipv4_rcv(mbuf, newport);
+    } 
+    if (iph->next_proto_id == IPPROTO_UDP) { // for vxlan
+        int iphdr_len =  ip4_hdrlen(mbuf);
+        struct udp_hdr *udphdr = (struct udp_hdr *)((uint8_t *)iph + iphdr_len);
+        if ( htons(udphdr->dst_port) == 4789) {
+            // 确认是vxlan报文
+            mbuf->vvtep_addr = iph->dst_addr;
+            mbuf->vvtep_port = htons(udphdr->dst_port); // 永远都是4789
+            mbuf->cvtep_addr = iph->src_addr;
+            mbuf->cvtep_port = htons(udphdr->src_port);
+            mbuf->tnl_proto = IPPROTO_GRE  + 1;
+            // 获取vni
+
+            struct vxlan_hdr *vxlanhdr = (struct vxlan_hdr *)((uint8_t *)udphdr + sizeof(struct udp_hdr));
+            mbuf->vni = htonl(vxlanhdr->vx_vni << 8);
+            
+            // 去掉vxlan首部
+            if (ip_tunnel_pull_header(mbuf, sizeof(struct ipv4_hdr), IPPROTO_IP) != 0) {
+                return EDPVS_DROP;
+            }
+            // 去掉udp首部
+            if (ip_tunnel_pull_header(mbuf, sizeof(struct udp_hdr), IPPROTO_UDP) != 0) {
+                return EDPVS_DROP;
+            }
+            
+            // 去掉vxlan首部
+            if (ip_tunnel_pull_header(mbuf, sizeof(struct vxlan_hdr), IPPROTO_GRE + 1) != 0) {
+                return EDPVS_DROP;
+            }
+            // // 得到内层的以太帧
+            struct ether_hdr *ethhdr = eth_hdr(mbuf);
+            if (ethhdr == NULL) {
+                return EDPVS_DROP;
+            }
+            if (ip_tunnel_pull_header(mbuf, sizeof(struct ether_hdr), 0) != 0) {
+                return EDPVS_DROP;
+            }
+
+            struct netif_port *newport = netif_port_get_by_name("gre1");
+            return ipv4_rcv(mbuf, newport);
+        }
+    }
+ 
     hlen = ip4_hdrlen(mbuf);
     if (((iph->version_ihl) >> 4) != 4 || hlen < sizeof(struct ipv4_hdr))
         goto inhdr_error;
@@ -619,3 +680,20 @@ int ipv4_unregister_protocol(struct inet_protocol *prot,
 
     return err;
 }
+
+void uint32_to_ip(char *ip_str, uint32_t ip_addr) {
+    // arr[INET_ADDRSTRLEN];
+    uint8_t a = (ip_addr >> 24) & 0xFF;
+    uint8_t b  = (ip_addr >> 16) & 0xFF;
+    uint8_t c  = (ip_addr >> 8) & 0xFF;
+    uint8_t d  = ip_addr & 0xFF;
+
+    sprintf(ip_str, "%d.%d.%d.%d", d, c, b, a);
+}
+
+void chars_to_mac(char *mac_str, struct ether_addr mac_addr) {
+    sprintf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x",
+           mac_addr.addr_bytes[0], mac_addr.addr_bytes[1], mac_addr.addr_bytes[2],
+           mac_addr.addr_bytes[3], mac_addr.addr_bytes[4], mac_addr.addr_bytes[5]);
+}
+

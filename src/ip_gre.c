@@ -30,21 +30,22 @@
 #include "ip_tunnel.h"
 
 #define GRE
-#define RTE_LOGTYPE_GRE     RTE_LOGTYPE_USER1
+#define RTE_LOGTYPE_GRE RTE_LOGTYPE_USER1
 
-#define GRE_F_CSUM          htobe16(0x8000)
-#define GRE_F_ROUTING       htobe16(0x4000)
-#define GRE_F_KEY           htobe16(0x2000)
-#define GRE_F_SEQ           htobe16(0x1000)
-#define GRE_F_STRICT        htobe16(0x0800)
-#define GRE_F_REC           htobe16(0x0700)
-#define GRE_F_FLAGS         htobe16(0x00F8)
-#define GRE_F_VERSION       htobe16(0x0007)
+#define GRE_F_CSUM htobe16(0x8000)
+#define GRE_F_ROUTING htobe16(0x4000)
+#define GRE_F_KEY htobe16(0x2000)
+#define GRE_F_SEQ htobe16(0x1000)
+#define GRE_F_STRICT htobe16(0x0800)
+#define GRE_F_REC htobe16(0x0700)
+#define GRE_F_FLAGS htobe16(0x00F8)
+#define GRE_F_VERSION htobe16(0x0007)
 
 /* linux: net/gre.h */
-struct gre_base_hdr {
-    __be16  flags;
-    __be16  protocol;
+struct gre_base_hdr
+{
+    __be16 flags;
+    __be16 protocol;
 } __attribute__((__packed__));
 
 static struct ip_tunnel_tab gre_tunnel_tab;
@@ -120,7 +121,7 @@ static inline int gre_calc_hlen(__be16 o_flags)
 
 /* linux: gre_build_header */
 static int gre_build_header(struct rte_mbuf *mbuf, int hlen, __be16 flags,
-                            __be16 proto, __be32 key, __be32 seq)
+                     __be16 proto, __be32 key, __be32 seq)
 {
     struct gre_base_hdr *greh;
 
@@ -133,7 +134,8 @@ static int gre_build_header(struct rte_mbuf *mbuf, int hlen, __be16 flags,
     greh->flags = flags_tnl2gre(flags);
     greh->protocol = proto;
 
-    if (flags & (TUNNEL_F_KEY | TUNNEL_F_CSUM | TUNNEL_F_SEQ)) {
+    if (flags & (TUNNEL_F_KEY | TUNNEL_F_CSUM | TUNNEL_F_SEQ))
+    {
         __be32 *ptr = (__be32 *)(((uint8_t *)greh) + hlen - 4);
 
         if (flags & TUNNEL_F_SEQ)
@@ -142,7 +144,8 @@ static int gre_build_header(struct rte_mbuf *mbuf, int hlen, __be16 flags,
         if (flags & TUNNEL_F_KEY)
             *ptr-- = key;
 
-        if (flags & TUNNEL_F_CSUM) {
+        if (flags & TUNNEL_F_CSUM)
+        {
             *ptr = 0;
             *(__be16 *)ptr = gre_checksum(mbuf);
         }
@@ -178,12 +181,14 @@ static int gre_parse_header(struct rte_mbuf *mbuf,
     tpi->proto = greh->protocol;
 
     options = (__be32 *)(greh + 1);
-    if (greh->flags & GRE_F_CSUM) {
+    if (greh->flags & GRE_F_CSUM)
+    {
         /* XXX: not support segments for csum */
         if (unlikely(mbuf->next != NULL))
             return EDPVS_INVPKT;
 
-        if (unlikely(rte_raw_cksum(greh, mbuf->data_len) != 0xffff)) {
+        if (unlikely(rte_raw_cksum(greh, mbuf->data_len) != 0xffff))
+        {
             *csum_err = true;
             return EDPVS_INVPKT;
         }
@@ -205,7 +210,16 @@ static int gre_parse_header(struct rte_mbuf *mbuf,
     return hlen;
 }
 
-static int gre_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
+int gre_xmit_header(struct rte_mbuf *mbuf) {
+    struct gre_base_hdr *greh = (struct gre_base_hdr *)rte_pktmbuf_prepend(mbuf, (uint16_t)sizeof(struct gre_base_hdr));
+    if (unlikely(!greh))
+        return EDPVS_NOROOM;
+    greh->flags = 0;
+    greh->protocol = htons(mbuf->packet_type);
+    return EDPVS_OK;
+}
+
+int gre_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
 {
     struct ip_tunnel *tnl = netif_priv(dev);
     const struct iphdr *tiph = &tnl->params.iph;
@@ -219,12 +233,14 @@ static int gre_xmit(struct rte_mbuf *mbuf, struct netif_port *dev)
     err = gre_build_header(mbuf, tnl->hlen, tnl->params.o_flags,
                            htons(mbuf->packet_type), tnl->params.o_key,
                            htonl(tnl->o_seqno));
-    if (err != EDPVS_OK) {
+    if (err != EDPVS_OK)
+    {
         rte_pktmbuf_free(mbuf);
         return err;
     }
 
-    return ip_tunnel_xmit(mbuf, dev, tiph, IPPROTO_GRE);
+    int ret = ip_tunnel_xmit(mbuf, dev, tiph, IPPROTO_GRE);
+    return ret;
 }
 
 static int gre_dev_init(struct netif_port *dev)
@@ -237,10 +253,10 @@ static int gre_dev_init(struct netif_port *dev)
 }
 
 static struct netif_ops gre_dev_ops = {
-    .op_init        = gre_dev_init,
-    .op_xmit        = gre_xmit,
-    .op_get_link    = ip_tunnel_get_link,
-    .op_get_stats   = ip_tunnel_get_stats,
+    .op_init = gre_dev_init,
+    .op_xmit = gre_xmit,
+    .op_get_link = ip_tunnel_get_link,
+    .op_get_stats = ip_tunnel_get_stats,
     .op_get_promisc = ip_tunnel_get_promisc,
 };
 
@@ -274,9 +290,13 @@ static int gre_rcv(struct rte_mbuf *mbuf)
     iph = mbuf->userdata; /* see ipv4_local_in_fin */
     assert(iph->version == 4 && iph->protocol == IPPROTO_GRE);
 
+    mbuf->vvtep_addr = iph->daddr;
+    mbuf->cvtep_addr = iph->saddr;
+
     tnl = ip_tunnel_lookup(&gre_tunnel_tab, mbuf->port, tpi.flags,
                            iph->saddr, iph->daddr, tpi.key);
-    if (!tnl) {
+    if (!tnl)
+    { // 入向GRE隧道检查
         icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
         goto drop;
     }
@@ -292,14 +312,14 @@ drop:
 }
 
 static struct ip_tunnel_ops gre_tnl_ops = {
-    .kind       = "gre",
-    .priv_size  = sizeof(struct ip_tunnel),
-    .setup      = gre_setup,
-    .change     = gre_change,
+    .kind = "gre",
+    .priv_size = sizeof(struct ip_tunnel),
+    .setup = gre_setup,
+    .change = gre_change,
 };
 
 static struct inet_protocol gre_proto = {
-    .handler    = gre_rcv,
+    .handler = gre_rcv,
 };
 
 int gre_init(void)
@@ -311,7 +331,8 @@ int gre_init(void)
         return err;
 
     err = ipv4_register_protocol(&gre_proto, IPPROTO_GRE);
-    if (err != EDPVS_OK) {
+    if (err != EDPVS_OK)
+    {
         ip_tunnel_term_tab(&gre_tunnel_tab);
         return err;
     }

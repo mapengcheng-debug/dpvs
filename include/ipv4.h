@@ -22,6 +22,7 @@
 #include "inet.h"
 #include "netif.h"
 #include "route.h"
+#include "rte_ether.h"
 
 #define IPPROTO_OSPF        89 /* OSPF protocol */
 
@@ -144,5 +145,16 @@ static inline bool ip4_is_frag(struct ipv4_hdr *iph)
     return (iph->fragment_offset
             & htons(IPV4_HDR_MF_FLAG | IPV4_HDR_OFFSET_MASK)) != 0;
 }
+
+static inline struct ether_hdr *eth_hdr(const struct rte_mbuf *mbuf)
+{
+    /* can only invoked at L3 */
+    return rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
+}
+
+
+void uint32_to_ip(char *ip_str, uint32_t ip_addr);
+
+void chars_to_mac(char *mac_str, struct ether_addr mac_addr);
 
 #endif /* __DPVS_IPV4_H__ */

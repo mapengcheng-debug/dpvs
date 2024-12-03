@@ -806,6 +806,8 @@ struct dp_vs_conn *dp_vs_conn_new(struct rte_mbuf *mbuf,
                                   struct dp_vs_conn_param *param,
                                   struct dp_vs_dest *dest, uint32_t flags)
 {
+
+    // mapengcheng.123 关键代码，重点标记
     struct dp_vs_conn *new;
     struct conn_tuple_hash *t;
     uint16_t rport;
@@ -874,6 +876,21 @@ struct dp_vs_conn *dp_vs_conn_new(struct rte_mbuf *mbuf,
     new->vport  = param->vport;
     new->laddr  = *param->caddr;    /* non-FNAT */
     new->lport  = param->cport;     /* non-FNAT */
+
+    
+    new->tnl_proto = mbuf->tnl_proto;
+    if (mbuf->tnl_proto == IPPROTO_GRE) {
+        new->vvtep_addr = mbuf->vvtep_addr;
+        new->cvtep_addr = mbuf->cvtep_addr;
+    } else if (mbuf->tnl_proto == IPPROTO_GRE + 1) {
+        new->vvtep_addr = mbuf->vvtep_addr;
+        new->cvtep_addr = mbuf->cvtep_addr;
+        new->cvtep_port = mbuf->cvtep_port;
+        new->vvtep_port = mbuf->vvtep_port;
+        new->vni = mbuf->vni;
+    }
+
+
     if (dest->fwdmode == DPVS_FWD_MODE_SNAT)
         new->daddr  = iph->saddr;
     else

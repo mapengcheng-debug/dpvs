@@ -47,6 +47,7 @@ struct ip_tunnel_ops {
 #define IP_TNL_HASH_BITS    7
 #define IP_TNL_HASH_SIZE    (1 << IP_TNL_HASH_BITS)
 
+
 /* table of tunnels for each kind. */
 struct ip_tunnel_tab {
     struct netif_port       *fb_tunnel_dev; /* fullback device */
@@ -108,4 +109,11 @@ int ipip_term(void);
 int gre_init(void);
 int gre_term(void);
 
+int gre_xmit(struct rte_mbuf *mbuf, struct netif_port *dev);
+int gre_xmit_header(struct rte_mbuf *mbuf);
+int tunnel_xmit(struct rte_mbuf *mbuf, __be32 src, __be32 dst,
+                       uint8_t proto, uint8_t tos, uint8_t ttl, __be16 df);
+
+int ip_tunnel_xmit_2(struct rte_mbuf *mbuf, struct netif_port *dev,
+                   const struct iphdr *tiph, uint8_t proto);
 #endif /* __DPVS_TUNNEL_H__ */

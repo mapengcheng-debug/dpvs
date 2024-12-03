@@ -21,6 +21,7 @@
 #include "dpdk.h"
 #include "ipv4.h"
 #include "ipv6.h"
+#include "ip_tunnel.h"
 #include "route.h"
 #include "route6.h"
 #include "icmp.h"
@@ -30,6 +31,7 @@
 #include "ipvs/nat64.h"
 #include "parser/parser.h"
 
+// static bool fast_xmit_close = false;
 static bool fast_xmit_close = false;
 static bool xmit_ttl = false;
 
@@ -66,6 +68,8 @@ static int __dp_vs_fast_xmit_fnat4(struct dp_vs_proto *proto,
     ip4h->src_addr = conn->laddr.in.s_addr;
     ip4h->dst_addr = conn->daddr.in.s_addr;
 
+
+
     if(proto->fnat_in_handler) {
         err = proto->fnat_in_handler(proto, conn, mbuf);
         if(err != EDPVS_OK)
@@ -77,6 +81,9 @@ static int __dp_vs_fast_xmit_fnat4(struct dp_vs_proto *proto,
     } else {
         ip4_send_csum(ip4h);
     }
+
+
+    // 封装gre首部
 
     eth = (struct ether_hdr *)rte_pktmbuf_prepend(mbuf,
                     (uint16_t)sizeof(struct ether_hdr));
@@ -155,6 +162,59 @@ static int dp_vs_fast_xmit_fnat(int af,
         : __dp_vs_fast_xmit_fnat6(proto, conn, mbuf);
 }
 
+static int __dp_vs_xmit_ip_hdr(struct rte_mbuf *mbuf, uint8_t proto) {
+    struct netif_port *dev = netif_port_get_by_name("gre1");
+    struct ip_tunnel *tnl = netif_priv(dev);
+    const struct iphdr *tiph = &tnl->params.iph;
+
+    int ret = ip_tunnel_xmit_2(mbuf, dev, tiph, proto);
+    return ret;
+}
+
+static int __dp_vs_xmit_gre(struct rte_mbuf *mbuf) {
+    int err = gre_xmit_header(mbuf);
+    if (err != EDPVS_OK)
+    {
+        rte_pktmbuf_free(mbuf);
+        printf("fail to gre_xmit_header\n");
+        return err;
+    }
+
+    err = __dp_vs_xmit_ip_hdr(mbuf, IPPROTO_GRE);
+    if (err != EDPVS_OK) {
+        rte_pktmbuf_free(mbuf);
+        printf("fail to __dp_vs_xmit_ip_hdr\n");
+        return err;
+    }
+
+    return EDPVS_OK;
+}
+
+
+static int __dp_vs_xmit_vxlan(struct rte_mbuf *mbuf) {
+    // 先加上以太头
+    struct vxlan_hdr *vxlanhdr = (struct vxlan_hdr *)rte_pktmbuf_prepend(mbuf, (uint16_t)sizeof(struct vxlan_hdr));
+    if (unlikely(!vxlanhdr))
+        return EDPVS_NOROOM;
+    vxlanhdr->vx_flags = rte_cpu_to_be_32(0x08000000);
+    vxlanhdr->vx_vni = rte_cpu_to_be_32(mbuf->vni << 8);
+
+    // 加udp头部
+    struct udp_hdr *udphdr = (struct udp_hdr *)rte_pktmbuf_prepend(mbuf, (uint16_t)sizeof(struct udp_hdr));
+    udphdr->src_port = rte_cpu_to_be_16(mbuf->cvtep_port);
+    udphdr->dst_port = rte_cpu_to_be_16(mbuf->vvtep_port);
+    udphdr->dgram_len = htons(mbuf->pkt_len);
+
+    int err = __dp_vs_xmit_ip_hdr(mbuf, IPPROTO_UDP);
+    if (err != EDPVS_OK) {
+        rte_pktmbuf_free(mbuf);
+        return err;
+    }
+
+    return EDPVS_OK;
+    // return ret;
+}
+
 static int __dp_vs_fast_outxmit_fnat4(struct dp_vs_proto *proto,
                                       struct dp_vs_conn *conn,
                                       struct rte_mbuf *mbuf)
@@ -198,6 +258,22 @@ static int __dp_vs_fast_outxmit_fnat4(struct dp_vs_proto *proto,
         ip4h->hdr_checksum = 0;
     } else {
         ip4_send_csum(ip4h);
+    }
+
+
+    if (conn->tnl_proto == IPPROTO_GRE) {
+        mbuf->packet_type = packet_type;
+        return __dp_vs_xmit_gre(mbuf);
+    } else if (conn->tnl_proto == IPPROTO_GRE + 1) {
+        struct ether_hdr *ethhdr = (struct ether_hdr *)rte_pktmbuf_prepend(mbuf, (uint16_t)sizeof(struct ether_hdr));
+        if (unlikely(!ethhdr))
+            return EDPVS_NOROOM;
+        ethhdr->s_addr = conn->out_smac;
+        ethhdr->d_addr = conn->out_dmac;
+        ethhdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv4);
+
+        // 新增vxlan头部
+        return __dp_vs_xmit_vxlan(mbuf);
     }
 
     eth = (struct ether_hdr *)rte_pktmbuf_prepend(mbuf,
@@ -721,6 +797,20 @@ static int __dp_vs_out_xmit_fnat4(struct dp_vs_proto *proto,
     struct ipv4_hdr *iph = ip4_hdr(mbuf);
     struct route_entry *rt;
     int err, mtu;
+
+    if (conn->tnl_proto == IPPROTO_GRE) {
+        mbuf->tnl_proto = conn->tnl_proto;
+        mbuf->cvtep_addr = conn->cvtep_addr;
+        mbuf->vvtep_addr = conn->vvtep_addr;
+    } else if (conn->tnl_proto == IPPROTO_GRE + 1) {
+        mbuf->tnl_proto = conn->tnl_proto;
+        mbuf->cvtep_addr = conn->cvtep_addr;
+        mbuf->vvtep_addr = conn->vvtep_addr;
+        mbuf->cvtep_port = conn->cvtep_port;
+        mbuf->vvtep_port = conn->vvtep_port;
+        mbuf->vni = conn->vni;
+    }
+
 
     if (!fast_xmit_close && !(conn->flags & DPVS_CONN_F_NOFASTXMIT)) {
         dp_vs_save_outxmit_info(mbuf, proto, conn);
@@ -1661,6 +1751,12 @@ static int dp_vs_fast_outxmit_nat(struct dp_vs_proto *proto,
     } else {
         ip4_send_csum(iph);
     }
+
+    char src_addr[20], dst_addr[20];
+    chars_to_mac(src_addr, conn->out_smac);
+    chars_to_mac(dst_addr, conn->out_dmac);
+    printf("%s  source mac: %s, dest mac: %s\n",__func__, src_addr, dst_addr);
+
 
     eth = (struct ether_hdr *)rte_pktmbuf_prepend(mbuf,
                     (uint16_t)sizeof(struct ether_hdr));

@@ -96,6 +96,13 @@ struct dp_vs_conn {
     uint16_t                lport;
     uint16_t                dport;
 
+    uint8_t                 tnl_proto; // 隧道类型, vxlan or gre?
+    uint32_t                cvtep_addr;
+    uint32_t                vvtep_addr;
+    uint16_t                cvtep_port;
+    uint16_t                vvtep_port;
+    uint8_t                 vni;   
+
     struct rte_mempool      *connpool;
     struct conn_tuple_hash  tuplehash[DPVS_CONN_DIR_MAX];
     rte_atomic32_t          refcnt;
